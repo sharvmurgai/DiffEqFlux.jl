@@ -27,9 +27,10 @@ First, we import the necessary Julia libraries. `OrdinaryDiffEq.jl` provides the
 
 ```@example stiff_bruss
 using OrdinaryDiffEq
+using OrdinaryDiffEqSDIRK: KenCarp47, TRBDF2
 using LinearSolve
 using SciMLBase
-using ADTypes: AutoForwardDiff
+using ADTypes: AutoFiniteDiff, AutoForwardDiff
 using Lux
 using Optimization, OptimizationOptimisers
 using Optimisers
@@ -265,7 +266,7 @@ The baseline kinetics deliberately use `B0 = 0.8` while the reference uses `B = 
 
 ```@example stiff_bruss
 println("Stage 2/4: Set loss + optimizer …"); flush(stdout)
-const ALG_FINAL   = TRBDF2(autodiff=false)
+const ALG_FINAL   = TRBDF2(autodiff=AutoFiniteDiff())
 const FINAL_RTOL  = 1f-4
 const FINAL_ATOL  = 1f-4
 const FINAL_DTMAX = 0.1f0
@@ -281,7 +282,7 @@ const Yref_train = Yref[:,:,:,TRAIN_IDX]
 const W_WEIGHTS  = reshape(1 .+ collect(ts_train)./maximum(ts_train), 1,1,1,length(TRAIN_IDX))
 
 function loss(θ_vec)
-    sol = solve(remake(prob_ude; p=θ_vec), TRBDF2(autodiff=false);
+    sol = solve(remake(prob_ude; p=θ_vec), TRBDF2(autodiff=AutoFiniteDiff());
                 saveat=ts_train, reltol=1f-4, abstol=1f-4,
                 save_everystep=false)
     Y = Array(sol)
