@@ -12,7 +12,7 @@ A **Universal Differential Equation (UDE)** is a hybrid modeling approach that m
 
 In this example, we will:
 1.  Generate "ground truth" data by solving the full, known Brusselator PDE.
-2.  Define a UDE where the diffusion term is explicitly coded, but the reaction term is replaced by a neural network.
+2.  Define a UDE with explicitly coded diffusion and partial Brusselator kinetics, then use a neural residual to learn the missing contribution.
 3.  Train the neural network's parameters by requiring the UDE's solution to match the ground truth data.
 4.  Visualize the results to confirm that our UDE has successfully learned the unknown reaction dynamics.
 
@@ -22,39 +22,58 @@ This showcases the power of scientific machine learning (SciML) to discover gove
 
 ### 1. Problem Setup and Dependencies
 
-First, we import the necessary Julia libraries. We'll use `DifferentialEquations.jl` for solving ODEs, `Lux.jl` for the neural network, `Optimization.jl` for training, and `Plots.jl` for visualization. We then define the simulation constants, such as grid size and simulation time.
+First, we import the necessary Julia libraries. `OrdinaryDiffEq.jl` provides the ODE solvers, alongside `Lux.jl`, `Optimization.jl`, and `Plots.jl`. The rendered example uses a bounded grid and horizon; set `STIFF_FULL=true` to select the larger configuration for a local run.
 
 
 ```@example stiff_bruss
-using OrdinaryDiffEq, DifferentialEquations
+using OrdinaryDiffEq
 using LinearSolve
-using SciMLSensitivity
+using SciMLBase
+using ADTypes: AutoForwardDiff
 using Lux
 using Optimization, OptimizationOptimisers
 using Optimisers
 using NNlib
-using Random, Zygote
-using Plots, Statistics
+using Random
+using Plots
 using Base.Threads
 using ComponentArrays
-using JLD2
 using Dates
 # We disable the default plot saving and display them directly.
 
 # 1. Problem Setup: Constants, Grid, and Initial Conditions
 
 # -- Simulation Parameters --
-const N         = 16
-const TEND      = 12.0f0
-const MAXITERS  = 200
+const FULL_RUN  = get(ENV, "STIFF_FULL", "false") == "true"
+const N         = FULL_RUN ? 16 : 8
+const TEND      = FULL_RUN ? 12.0f0 : 2.0f0
+const MAXITERS  = FULL_RUN ? 200 : 20
 const RTOL_REF  = 1f-6
 const ATOL_REF  = 1f-6
 
 # -- Grid and Discretization --
-const xyd = range(0f0, stop=1f0, length=N)
-dx = step(xyd)
+const xyd = range(0f0; step=1f0 / N, length=N)
+const dx = step(xyd)
+const α = 10.0f0
+const αdx2 = α / (dx*dx)
 
 @inline limit(a::Int, N::Int) = a == N + 1 ? 1 : (a == 0 ? N : a)
+@inline function periodic_laplacian(u, i, j, k, N)
+    return u[limit(i-1,N),j,k] + u[limit(i+1,N),j,k] +
+           u[i,limit(j-1,N),k] + u[i,limit(j+1,N),k] - 4f0*u[i,j,k]
+end
+const cosine_field = repeat(
+    [cos(2f0 * Float32(π) * Float32(i-1) / N) for i in 1:N, j in 1:N, k in 1:1],
+    1, 1, 2,
+)
+const discrete_cosine_laplacian = 2f0 * (cos(2f0 * Float32(π) / N) - 1f0)
+for (i,j) in ((1,1), (cld(N,2), cld(N,2)))
+    for species in 1:2
+        measured_diffusion = αdx2 * periodic_laplacian(cosine_field, i, j, species, N)
+        expected_diffusion = αdx2 * discrete_cosine_laplacian * cosine_field[i,j,species]
+        @assert isapprox(measured_diffusion, expected_diffusion; rtol=8f-6, atol=8f-6)
+    end
+end
 @inline brusselator_f(x, y, t) =
     (((x - 0.3f0)^2 + (y - 0.6f0)^2) <= 0.1f0^2) * (t >= 1.1f0) * 5.0f0
 
@@ -69,8 +88,6 @@ function init_u0(xyd)
     return u
 end
 const u0   = init_u0(xyd)
-const α    = 10.0f0
-const αdx2 = α / (dx*dx)
 ```
 
 ### 2. Generating the Reference Solution (Ground Truth)
@@ -88,8 +105,8 @@ function rhs_ref!(du, u, p, t)
         ip1, im1 = limit(i+1,N), limit(i-1,N)
         jp1, jm1 = limit(j+1,N), limit(j-1,N)
         u1 = u[i,j,1]; v1 = u[i,j,2]
-        lap_u = u[im1,j,1] + u[ip1,j,1] + u[i,jp1,1] + u[i,jm1,1] - 4f0*u1
-        lap_v = u[im1,j,2] + u[ip1,j,2] + u[i,jp1,2] + u[i,jm1,2] - 4f0*v1
+        lap_u = periodic_laplacian(u, i, j, 1, N)
+        lap_v = periodic_laplacian(u, i, j, 2, N)
         du[i,j,1] = αval_dx2*lap_u + B + u1^2*v1 - (A+1f0)*u1 + brusselator_f(x,y,t)
         du[i,j,2] = αval_dx2*lap_v + A*u1 - u1^2*v1
     end
@@ -99,17 +116,18 @@ end
 p_ref    = (3.4f0, 1.0f0, 10.0f0)
 prob_ref = ODEProblem(rhs_ref!, u0, (0.0f0, TEND), p_ref)
 sol_ref  = solve(prob_ref, KenCarp47(linsolve=LinearSolve.KrylovJL_GMRES());
-                    saveat=0.0f0:0.5f0:TEND, reltol=RTOL_REF, abstol=ATOL_REF, progress=true)
+                    saveat=0.0f0:0.5f0:TEND, reltol=RTOL_REF, abstol=ATOL_REF)
+@assert SciMLBase.successful_retcode(sol_ref)
+@assert sol_ref.t == collect(0.0f0:0.5f0:TEND)
 
 global Yref = Array(sol_ref)
 global ts   = sol_ref.t
 
-const mean_true = [mean(Yref[:,:,1,i]) for i in 1:size(Yref,4)]
 println("Ground truth loaded. Size: ", size(Yref))
 ```
 
 ### 3. Defining the Neural Network
-Next, we define the neural network architecture that will learn the unknown reaction term. The model is a simple multi-layer perceptron with a custom SigmaLayer that applies a learnable, exponentially decaying weight to its inputs. We also create helper functions (flatten_ps, to_ps) to convert the network's parameters between Lux's structured format and the flat vector format required by the optimizer.
+The model places a trainable diagonal scaling between two dense subnetworks. Its initial weights decrease with the mode index. `ComponentArray` exposes the structured Lux parameters as a vector for the optimizer.
 
 ```@example stiff_bruss
 # 3. Neural Network (UDE Component)
@@ -120,7 +138,7 @@ Next, we define the neural network architecture that will learn the unknown reac
 import LuxCore: initialparameters, initialstates
 
 """
-SigmaDiag: diagonal Σ in state space (m = length(x)), PSD with mode-indexed decay.
+Nonnegative diagonal scaling with mode-indexed weights.
 """
 struct SigmaDiag <: Lux.AbstractLuxLayer
     kind::Symbol  # :logistic or :exp
@@ -183,24 +201,22 @@ const ST = st0
 ```
 
 ### 4. Constructing the Universal Differential Equation (UDE)
-Here is the core of the UDE. The rhs_ude! function defines the hybrid dynamics. It explicitly calculates the diffusion term (the known physics) and calls the neural network to approximate the reaction term (the unknown physics). This function is then used to create an ODEProblem that can be solved and differentiated.
+Here is the core of the UDE. `rhs_ude!` keeps the known diffusion and Brusselator reaction structure, but starts with incomplete kinetics: `B0 = 0.8` instead of the reference production term `B = 1.0`. The residual network must learn the missing `+0.2` contribution to the first species. This function defines the ODEProblem used for training and evaluation.
 
 ```@example stiff_bruss
 const RESIDUAL   = true
 const COUT       = 8.0
-const RESID_COUT = 0.7 
+const RESID_COUT = 0.7
 const A0         = 3.4
-const B0         = 1.0
+const B0         = 0.8f0
 
 function rhs_ude!(du, u, θ_vec, t)
     Tz = eltype(u)
     @inbounds for I in CartesianIndices((N,N))
         i, j = Tuple(I); x = xyd[i]; y = xyd[j]
         u1 = u[i,j,1]; v1 = u[i,j,2]
-        lap_u = u[limit(i-1,N),j,1] + u[limit(i+1,N),j,1] +
-                u[i,limit(j+1,N),1] + u[i,limit(j-1,N),1] - 4f0*u1
-        lap_v = u[limit(i-1,N),j,2] + u[limit(i+1,N),j,2] +
-                u[i,limit(j+1,N),2] + u[i,limit(j-1,N),2] - 4f0*v1
+        lap_u = periodic_laplacian(u, i, j, 1, N)
+        lap_v = periodic_laplacian(u, i, j, 2, N)
         ŷ, _ = model(Tz[u1, v1], θ_vec, ST)
         if RESIDUAL
             r1 = B0 + u1^2*v1 - (A0 + 1f0)*u1
@@ -219,15 +235,36 @@ function rhs_ude!(du, u, θ_vec, t)
 end
 
 prob_ude = ODEProblem(rhs_ude!, u0, (0.0f0, TEND), θ0)
+
+# Exercise the reference and UDE RHS stencils on the discrete cosine mode.
+# Subtract each known reaction/forcing term to isolate diffusion.
+stencil_du_ref = similar(cosine_field)
+stencil_du_ude = similar(cosine_field)
+rhs_ref!(stencil_du_ref, cosine_field, p_ref, 0.0f0)
+rhs_ude!(stencil_du_ude, cosine_field, zero.(θ0), 0.0f0)
+for (i,j) in ((1,1), (cld(N,2), cld(N,2))), species in 1:2
+    u1 = cosine_field[i,j,1]
+    v1 = cosine_field[i,j,2]
+    reaction_ref = species == 1 ? p_ref[2] + u1^2*v1 - (p_ref[1] + 1f0)*u1 +
+                                 brusselator_f(xyd[i], xyd[j], 0.0f0) :
+                                 p_ref[1]*u1 - u1^2*v1
+    reaction_ude = species == 1 ? B0 + u1^2*v1 - (A0 + 1f0)*u1 +
+                                 brusselator_f(xyd[i], xyd[j], 0.0f0) :
+                                 A0*u1 - u1^2*v1
+    expected_diffusion = αdx2 * discrete_cosine_laplacian * cosine_field[i,j,species]
+    tol = 32f0 * eps(Float32) * max(1f0, abs(expected_diffusion))
+    @assert isapprox(stencil_du_ref[i,j,species] - reaction_ref, expected_diffusion;
+                     rtol=32f0*eps(Float32), atol=tol)
+    @assert isapprox(stencil_du_ude[i,j,species] - reaction_ude, expected_diffusion;
+                     rtol=32f0*eps(Float32), atol=tol)
+end
 ```
 
 ### 5. Training the UDE
-With the UDE defined, we can now train it. The loss function solves the UDE with the current neural network parameters and computes the mean squared error against the reference data. We use Optimization.jl with the Adam optimizer to minimize this loss. SciMLSensitivity.jl provides the functionality to efficiently compute gradients of the loss function with respect to the network parameters, even though the parameters are inside a differential equation solver.
+The baseline kinetics deliberately use `B0 = 0.8` while the reference uses `B = 1.0`, leaving a known `+0.2` contribution to the first species for the neural residual to learn. We train on the primary initial condition and evaluate on a distinct held-out initial condition. `AutoForwardDiff` differentiates through this reduced solve directly; this avoids relying on an adjoint gradient that must first agree with an independent reference.
 
 ```@example stiff_bruss
 println("Stage 2/4: Set loss + optimizer …"); flush(stdout)
-sensealg = InterpolatingAdjoint(autojacvec = ZygoteVJP())
-
 const ALG_FINAL   = TRBDF2(autodiff=false)
 const FINAL_RTOL  = 1f-4
 const FINAL_ATOL  = 1f-4
@@ -237,7 +274,7 @@ const FINAL_DTMAX = 0.1f0
 const LAMBDA = 3e-3
 
 # Curriculum in time for training only
-const TRAIN_FRAC = 1.0
+const TRAIN_FRAC = 0.75
 const TRAIN_IDX  = 1:clamp(ceil(Int, TRAIN_FRAC * length(ts)), 1, length(ts))
 const ts_train   = ts[TRAIN_IDX]
 const Yref_train = Yref[:,:,:,TRAIN_IDX]
@@ -246,7 +283,7 @@ const W_WEIGHTS  = reshape(1 .+ collect(ts_train)./maximum(ts_train), 1,1,1,leng
 function loss(θ_vec)
     sol = solve(remake(prob_ude; p=θ_vec), TRBDF2(autodiff=false);
                 saveat=ts_train, reltol=1f-4, abstol=1f-4,
-                save_everystep=false, sensealg=sensealg)
+                save_everystep=false)
     Y = Array(sol)
     if size(Y) != size(Yref_train)
         return Inf32
@@ -256,7 +293,23 @@ function loss(θ_vec)
     return data_mse + reg
 end
 
-optf    = OptimizationFunction((θ, _)->loss(θ), AutoZygote())
+# Check the optimizer's output-bias direction against tolerance-refined
+# central differences on the same seeded reduced solve.
+import ForwardDiff
+bias0 = θ0.U.layer_2.bias[1]
+const bias_direction = zero.(θ0)
+bias_direction.U.layer_2.bias[1] = 1f0
+output_bias(value) = loss(θ0 .+ (value - bias0) .* bias_direction)
+grad_ad = ForwardDiff.derivative(output_bias, bias0)
+hs = (2f-2, 1f-2, 5f-3)
+grad_fd = [(output_bias(bias0 + h) - output_bias(bias0 - h)) / (2h) for h in hs]
+fd_error = abs(grad_fd[end] - grad_fd[end-1])
+@assert fd_error > 0f0
+grad_tol = 4f0 * fd_error
+@assert abs(grad_ad - grad_fd[end]) <= grad_tol
+println("Output-bias directional derivative: AD=$grad_ad central=$grad_fd tolerance=$grad_tol")
+
+optf    = OptimizationFunction((θ, _)->loss(θ), AutoForwardDiff())
 optprob = OptimizationProblem(optf, θ0)
 
 println("Stage 3/4: Training …"); flush(stdout)
@@ -294,13 +347,9 @@ solopt = train_with_schedule()
 ```
 
 ### 6. Evaluation and Visualization
-Finally, after training, we evaluate the performance of our UDE. We solve the UDE one last time using the final, optimized parameters (θ★). We then create two plots to compare the UDE's solution to the ground truth:
+Finally, we evaluate the optimized UDE against reference data from a held-out initial condition and compare the spatial fields for both species:
 
-A heatmap showing the spatial concentration of one species at the final time point.
-
-A time-series plot showing the evolution of the mean concentration over the entire simulation.
-
-If the training was successful, the UDE's output should closely match the true simulation.
+The four heatmaps compare both species from the reference and learned solutions at the final time on the held-out initial condition. The printed relative squared field errors include every spatial node and both species. If training succeeds, the held-out error should improve over the zero-residual baseline, and the learned first-species residual should recover the missing `+0.2` at representative states.
 
 ```@example stiff_bruss
 println("\nStage 4/4: Final evaluation …"); flush(stdout)
@@ -316,13 +365,40 @@ println("  Final solve retcode = ", sol_ude_final.retcode)
 println("  Saved points = ", length(sol_ude_final.t))
 println("  Final solve wall time = $(round(time()-t_start; digits=3)) s")
 
-rel_mse = sum(abs2, Array(sol_ude_final) .- Yref) / sum(abs2, Yref)
-println("done. Final relative MSE = ", rel_mse)
+u0_holdout = init_u0(xyd) .* reshape(Float32[0.85, 1.1], 1, 1, 2)
+prob_holdout = ODEProblem(rhs_ref!, u0_holdout, (0.0f0, TEND), p_ref)
+sol_ref_holdout = solve(prob_holdout, KenCarp47(linsolve=LinearSolve.KrylovJL_GMRES());
+    saveat=ts, reltol=RTOL_REF, abstol=ATOL_REF)
+@assert SciMLBase.successful_retcode(sol_ref_holdout)
+prob_ude_holdout = ODEProblem(rhs_ude!, u0_holdout, (0.0f0, TEND), θ0)
+θzero = zero.(θ0)
+sol_ude_holdout_zero = solve(remake(prob_ude_holdout; p=θzero), ALG_FINAL; saveat=ts,
+    reltol=FINAL_RTOL, abstol=FINAL_ATOL, dtmax=FINAL_DTMAX)
+sol_ude_holdout = solve(remake(prob_ude_holdout; p=θ★), ALG_FINAL; saveat=ts,
+    reltol=FINAL_RTOL, abstol=FINAL_ATOL, dtmax=FINAL_DTMAX)
+@assert SciMLBase.successful_retcode(sol_ude_final)
+@assert SciMLBase.successful_retcode(sol_ude_holdout_zero)
+@assert SciMLBase.successful_retcode(sol_ude_holdout)
+@assert sol_ude_final.t == ts && sol_ref_holdout.t == ts && sol_ude_holdout.t == ts
+heldout_error(sol) = sum(abs2, Array(sol) .- Array(sol_ref_holdout)) / sum(abs2, Array(sol_ref_holdout))
+zero_error = heldout_error(sol_ude_holdout_zero)
+trained_error = heldout_error(sol_ude_holdout)
+@assert trained_error < zero_error
+println("done. Held-out relative squared field error: zero=$zero_error trained=$trained_error")
 
-mean_ude = [mean(u[:,:,1]) for u in sol_ude_final.u]
-plt_final = plot(ts, mean_true, label="True Simulation", lw=2,
-                 xlabel="Time (t)", ylabel="Mean Concentration",
-                 title="Model Performance (Final)")
-plot!(plt_final, ts, mean_ude, label=RESIDUAL ? "SNN Residual" : "SNN-UDE Prediction",
-      lw=2, linestyle=:dash)
+representative_states = (Float32[1, 1], Float32[2, 0.5], Float32[0.5, 2])
+correction = [model(state, θ★, ST)[1][1] for state in representative_states]
+@assert all(isapprox.(correction, 0.2f0; atol=0.12f0))
+println("Recovered first-species correction at representative states: ", correction)
+
+learned_holdout = Array(sol_ude_holdout)
+reference_holdout = Array(sol_ref_holdout)
+fields = Any[]
+for species in 1:2
+    push!(fields, heatmap(xyd, xyd, reference_holdout[:,:,species,end],
+                          title="Reference species $species"))
+    push!(fields, heatmap(xyd, xyd, learned_holdout[:,:,species,end],
+                          title="Learned species $species"))
+end
+plot(fields..., layout=(2,2))
 ```

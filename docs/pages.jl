@@ -16,6 +16,7 @@ pages = [
         "examples/neural_ode_weather_forecast.md",
         "examples/neural_gde.md",
         "examples/physical_constraints.md",
+        "examples/stiff_nn_bruss.md",
     ],
     "Layer APIs" => Any[
         "Continuous Normalizing Flows Layer" => "layers/CNFLayer.md",
