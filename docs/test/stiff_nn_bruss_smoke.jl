@@ -14,23 +14,28 @@ mktempdir() do root
     cp(PAGE, joinpath(root, "src", "stiff_nn_bruss.md"))
     ENV["GKSwstype"] = "100"
     started = time()
-    makedocs(
+    makedocs(;
         root = root,
         source = "src",
         build = "build",
         sitename = "DiffEqFlux tutorial smoke test",
         modules = Module[],
         pages = ["Stiff Brusselator" => "stiff_nn_bruss.md"],
-        format = Documenter.HTML(repolink = "https://github.com/SciML/DiffEqFlux.jl"),
+        format = Documenter.HTML(; repolink = "https://github.com/SciML/DiffEqFlux.jl"),
         remotes = nothing,
-        version = "smoke",
+        version = "smoke"
     )
     elapsed = time() - started
-    built_page = any(
-        "stiff_nn_bruss.html" in files ||
-            (basename(dir) == "stiff_nn_bruss" && "index.html" in files)
-            for (dir, _, files) in walkdir(joinpath(root, "build"))
-    )
+    built_page = false
+    for (dir, _, files) in walkdir(joinpath(root, "build"))
+        if "stiff_nn_bruss.html" in files
+            built_page = true
+            break
+        elseif basename(dir) == "stiff_nn_bruss" && "index.html" in files
+            built_page = true
+            break
+        end
+    end
     @assert built_page
     println("Docs smoke completed successfully in $(round(elapsed; digits = 2)) seconds")
 end
